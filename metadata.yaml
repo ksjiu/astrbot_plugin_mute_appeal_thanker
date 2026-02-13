@@ -1,0 +1,4 @@
+name: astrbot_plugin_mute_appeal_thanker
+author: 久孤(ksjiu)
+version: 3.0.0
+description: "当被禁言时，向管理员私聊求情；当被解禁时，向管理员发送感谢。"

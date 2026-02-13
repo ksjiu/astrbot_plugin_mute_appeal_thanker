@@ -1,0 +1,26 @@
+{
+  "cooldown_seconds": {
+    "description": "重复禁言/解禁冷却时间（秒）",
+    "type": "int",
+    "hint": "默认10秒内相同操作只发送一次。设为0则关闭重复检测功能。",
+    "default": 10
+  },
+  "admin_blacklist": {
+    "description": "管理员黑名单",
+    "type": "list",
+    "hint": "填写管理员QQ号。列表内QQ将不会收到任何私聊。",
+    "default": []
+  },
+  "fixed_plea_message": {
+    "description": "被禁言时发送的求情文案",
+    "type": "text",
+    "hint": "支持变量：{admin_name} (管理员昵称), {group_name} (群名称), {duration_str} (禁言时长)",
+    "default": "呜呜呜，{admin_name}大人，我做错了什么吗？我被您在群【{group_name}】里禁言了 {duration_str}，可以原谅我吗？"
+  },
+  "fixed_thanks_message": {
+    "description": "被解禁后的感谢文案",
+    "type": "text",
+    "hint": "支持变量：{admin_name} (管理员昵称), {group_name} (群名称)",
+    "default": "谢谢{admin_name}大人在群【{group_name}】里解除了我的禁言！我一定乖乖的，不再乱说话了！"
+  }
+}
