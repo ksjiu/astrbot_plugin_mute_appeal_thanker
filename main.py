@@ -17,7 +17,7 @@ from typing import Any
     "astrbot_plugin_mute_appeal_thanker",
     "久孤(ksjiu)",
     "当被禁言时私聊求情；被解除禁言时私聊感谢。",
-    "3.2.0",
+    "3.2.1",
 )
 class BanResponder(Star):
 
@@ -41,7 +41,6 @@ class BanResponder(Star):
             logger.error("cooldown_seconds 配置错误，已使用默认值 10")
             self.cooldown_seconds = 10
 
-        # 管理员维度限流（秒）
         try:
             self.admin_rate_limit = int(self.config.get("admin_rate_limit", 5) or 0)
         except Exception:
@@ -58,8 +57,7 @@ class BanResponder(Star):
         self._last_event_cache: dict[str, float] = {}
         self._admin_last_send: dict[str, float] = {}
 
-        # 严格串行锁（全局）
-        self._global_lock = asyncio.Lock()
+        self._state_lock = asyncio.Lock()
 
         logger.info("BanResponder 插件已启动。")
 
@@ -93,47 +91,49 @@ class BanResponder(Star):
             logger.error(f"模板格式化失败: {e}")
             return "消息模板存在错误，请检查配置。"
 
-    def _is_duplicate(self, key: str) -> bool:
-        if self.cooldown_seconds <= 0:
+    async def _check_and_mark(self, event_key: str, operator_id: str) -> bool:
+
+        if self.cooldown_seconds <= 0 and self.admin_rate_limit <= 0:
             return False
 
-        now = time.time()
+        async with self._state_lock:
+            now = time.time()
 
-        expired = [
-            k for k, v in self._last_event_cache.items()
-            if now - v > self.cooldown_seconds
-        ]
-        for k in expired:
-            del self._last_event_cache[k]
+            # 清理过期事件
+            expired = [
+                k for k, v in self._last_event_cache.items()
+                if now - v > self.cooldown_seconds
+            ]
+            for k in expired:
+                del self._last_event_cache[k]
 
-        last_time = self._last_event_cache.get(key)
+            # 事件级去重
+            if self.cooldown_seconds > 0:
+                last = self._last_event_cache.get(event_key)
+                if last and (now - last) < self.cooldown_seconds:
+                    return True
+                self._last_event_cache[event_key] = now
 
-        if last_time and (now - last_time) < self.cooldown_seconds:
-            return True
+            # 管理员级限流
+            if self.admin_rate_limit > 0:
+                last_admin = self._admin_last_send.get(operator_id)
+                if last_admin and (now - last_admin) < self.admin_rate_limit:
+                    return True
+                self._admin_last_send[operator_id] = now
 
-        self._last_event_cache[key] = now
-        return False
-
-    def _admin_rate_limited(self, operator_id: str) -> bool:
-        if self.admin_rate_limit <= 0:
             return False
-
-        now = time.time()
-        last = self._admin_last_send.get(operator_id)
-
-        if last and (now - last) < self.admin_rate_limit:
-            return True
-
-        self._admin_last_send[operator_id] = now
-        return False
 
     async def _get_group_name(self, client: Any, group_id: int) -> str:
         try:
-            return await asyncio.wait_for(
+            info = await asyncio.wait_for(
                 client.get_group_info(group_id=group_id),
-                timeout=5
-            ).then(lambda info: self._safe_text(info.get("group_name", group_id)))
-        except Exception:
+                timeout=5,
+            )
+            return self._safe_text(info.get("group_name", group_id))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"获取群名失败 group_id={group_id} err={e}")
             return str(group_id)
 
     async def _get_admin_name(self, client: Any, group_id: int, operator_id: int) -> str:
@@ -143,20 +143,27 @@ class BanResponder(Star):
                     group_id=group_id,
                     user_id=operator_id,
                 ),
-                timeout=5
+                timeout=5,
             )
             name = info.get("card") or info.get("nickname") or operator_id
             return self._safe_text(name)
-        except Exception:
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(
+                f"获取管理员昵称失败 group_id={group_id} operator_id={operator_id} err={e}"
+            )
             return str(operator_id)
 
     async def _send_private(self, client: Any, user_id: int, message: str) -> bool:
         try:
             await asyncio.wait_for(
                 client.send_private_msg(user_id=user_id, message=message),
-                timeout=5
+                timeout=5,
             )
             return True
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"发送私聊失败 user_id={user_id} err={e}")
             return False
@@ -164,71 +171,69 @@ class BanResponder(Star):
     @filter.event_message_type(EventMessageType.NOTICE)
     async def handle_notice(self, event: AiocqhttpMessageEvent):
 
-        async with self._global_lock:  # 严格串行执行
+        if event.get_platform_name() != "aiocqhttp":
+            return
 
-            if event.get_platform_name() != "aiocqhttp":
-                return
+        raw = getattr(event.message_obj, "raw_message", None)
+        if not isinstance(raw, dict):
+            return
 
-            raw = getattr(event.message_obj, "raw_message", None)
-            if not isinstance(raw, dict):
-                return
+        if raw.get("post_type") != "notice":
+            return
 
-            if raw.get("post_type") != "notice":
-                return
+        if raw.get("notice_type") != "group_ban":
+            return
 
-            if raw.get("notice_type") != "group_ban":
-                return
+        try:
+            bot_id = int(event.get_self_id())
+            target_id = int(raw.get("user_id"))
+            group_id = int(raw.get("group_id"))
+            operator_id = int(raw.get("operator_id"))
+            duration = int(raw.get("duration", 0))
+        except Exception:
+            logger.debug(f"字段解析失败 raw={raw}")
+            return
 
-            try:
-                bot_id = int(event.get_self_id())
-                target_id = int(raw.get("user_id"))
-                group_id = int(raw.get("group_id"))
-                operator_id = int(raw.get("operator_id"))
-                duration = int(raw.get("duration", 0))
-            except Exception:
-                return
+        if target_id != bot_id:
+            return
 
-            if target_id != bot_id:
-                return
+        if operator_id == bot_id:
+            return
 
-            if operator_id == bot_id:
-                return
+        if str(operator_id) in self.admin_blacklist:
+            return
 
-            if str(operator_id) in self.admin_blacklist:
-                return
+        # event_key 去掉 duration，避免平台浮动绕过去重
+        event_key = f"{group_id}:{operator_id}:{target_id}"
 
-            if self._admin_rate_limited(str(operator_id)):
-                return
+        blocked = await self._check_and_mark(event_key, str(operator_id))
+        if blocked:
+            return
 
-            event_key = f"{group_id}:{operator_id}:{target_id}:{duration}"
+        client = event.bot
 
-            if self._is_duplicate(event_key):
-                return
+        group_name = await self._get_group_name(client, group_id)
+        admin_name = await self._get_admin_name(client, group_id, operator_id)
 
-            client = event.bot
+        if duration > 0:
+            duration_text = self._parse_duration(duration)
+            message = self._safe_format(
+                self.plea_template,
+                admin_name=admin_name,
+                group_name=group_name,
+                duration_str=duration_text,
+            )
+        else:
+            message = self._safe_format(
+                self.thanks_template,
+                admin_name=admin_name,
+                group_name=group_name,
+            )
 
-            group_name = await self._get_group_name(client, group_id)
-            admin_name = await self._get_admin_name(client, group_id, operator_id)
+        sent = await self._send_private(client, operator_id, message)
 
-            if duration > 0:
-                duration_text = self._parse_duration(duration)
-                message = self._safe_format(
-                    self.plea_template,
-                    admin_name=admin_name,
-                    group_name=group_name,
-                    duration_str=duration_text,
-                )
-            else:
-                message = self._safe_format(
-                    self.thanks_template,
-                    admin_name=admin_name,
-                    group_name=group_name,
-                )
-
-            sent = await self._send_private(client, operator_id, message)
-
-            if sent:
-                event.stop_event()
+        if sent:
+            event.stop_event()
 
     async def terminate(self):
         logger.info("BanResponder 插件已卸载。")
