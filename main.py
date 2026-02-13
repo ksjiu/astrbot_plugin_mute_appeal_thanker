@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter
 from astrbot.api import AstrBotConfig, logger
@@ -7,18 +9,14 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
 )
 
 import time
-
-try:
-    from aiocqhttp import CQHttp
-except ImportError:
-    CQHttp = None
+from typing import Any
 
 
 @register(
     "astrbot_plugin_mute_appeal_thanker",
     "久孤(ksjiu)",
     "当被禁言时私聊求情；被解除禁言时私聊感谢。",
-    "3.0.0",
+    "3.1.0",
 )
 class BanResponder(Star):
 
@@ -36,10 +34,12 @@ class BanResponder(Star):
             "谢谢{admin_name}大人在群【{group_name}】解除了我的禁言！",
         )
 
-        self.cooldown_seconds = self.config.get("cooldown_seconds", 10)
-        self.admin_blacklist = self.config.get("admin_blacklist", [])
+        self.cooldown_seconds = int(self.config.get("cooldown_seconds", 10) or 0)
 
-        self._last_event_cache = {}
+        blacklist = self.config.get("admin_blacklist", [])
+        self.admin_blacklist = {str(i) for i in blacklist}
+
+        self._last_event_cache: dict[str, float] = {}
 
         logger.info("BanResponder 插件已启动。")
 
@@ -64,13 +64,29 @@ class BanResponder(Star):
         return text
 
     def _safe_text(self, text: str) -> str:
-        return text.replace("{", "【").replace("}", "】")
+        return str(text).replace("{", "【").replace("}", "】")
+
+    def _safe_format(self, template: str, **kwargs) -> str:
+        try:
+            return template.format(**kwargs)
+        except Exception as e:
+            logger.error(f"模板格式化失败: {e}")
+            return "消息模板存在错误，请检查配置。"
 
     def _is_duplicate(self, key: str) -> bool:
         if self.cooldown_seconds <= 0:
             return False
 
         now = time.time()
+
+        # 清理过期缓存
+        expired = [
+            k for k, v in self._last_event_cache.items()
+            if now - v > self.cooldown_seconds
+        ]
+        for k in expired:
+            del self._last_event_cache[k]
+
         last_time = self._last_event_cache.get(key)
 
         if last_time and (now - last_time) < self.cooldown_seconds:
@@ -79,40 +95,43 @@ class BanResponder(Star):
         self._last_event_cache[key] = now
         return False
 
-    async def _get_group_name(self, client: CQHttp, group_id: int) -> str:
+    async def _get_group_name(self, client: Any, group_id: int) -> str:
         try:
             info = await client.get_group_info(group_id=group_id)
-            return info.get("group_name", str(group_id))
-        except Exception:
+            return self._safe_text(info.get("group_name", group_id))
+        except Exception as e:
+            logger.debug(f"获取群名失败 group_id={group_id} err={e}")
             return str(group_id)
 
-    async def _get_admin_name(
-        self, client: CQHttp, group_id: int, operator_id: int
-    ) -> str:
+    async def _get_admin_name(self, client: Any, group_id: int, operator_id: int) -> str:
         try:
             info = await client.get_group_member_info(
                 group_id=group_id,
                 user_id=operator_id,
             )
-            name = info.get("card") or info.get("nickname") or str(operator_id)
+            name = info.get("card") or info.get("nickname") or operator_id
             return self._safe_text(name)
-        except Exception:
+        except Exception as e:
+            logger.debug(
+                f"获取管理员昵称失败 group_id={group_id} operator_id={operator_id} err={e}"
+            )
             return str(operator_id)
 
-    async def _send_private(self, client: CQHttp, user_id: int, message: str):
+    async def _send_private(self, client: Any, user_id: int, message: str) -> bool:
         try:
             await client.send_private_msg(user_id=user_id, message=message)
+            return True
         except Exception as e:
-            logger.error(f"发送私聊失败: {e}")
+            logger.error(f"发送私聊失败 user_id={user_id} err={e}")
+            return False
 
-    @filter.event_message_type(EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(EventMessageType.NOTICE)
     async def handle_notice(self, event: AiocqhttpMessageEvent):
 
         if event.get_platform_name() != "aiocqhttp":
             return
 
         raw = getattr(event.message_obj, "raw_message", None)
-
         if not isinstance(raw, dict):
             return
 
@@ -122,56 +141,54 @@ class BanResponder(Star):
         if raw.get("notice_type") != "group_ban":
             return
 
-        bot_id = int(event.get_self_id())
-        target_id = raw.get("user_id")
-
-        if target_id != bot_id:
+        try:
+            bot_id = int(event.get_self_id())
+            target_id = int(raw.get("user_id"))
+            group_id = int(raw.get("group_id"))
+            operator_id = int(raw.get("operator_id"))
+            duration = int(raw.get("duration", 0))
+        except Exception:
+            logger.debug("字段类型转换失败，忽略该事件")
             return
 
-        duration = raw.get("duration", 0)
-        group_id = raw.get("group_id")
-        operator_id = raw.get("operator_id")
-
-        if not operator_id:
+        if target_id != bot_id:
             return
 
         if operator_id == bot_id:
             return
 
-        if str(operator_id) in [str(i) for i in self.admin_blacklist]:
+        if str(operator_id) in self.admin_blacklist:
             return
 
-        event_key = f"{group_id}:{operator_id}:{duration}"
+        event_key = f"{group_id}:{operator_id}:{target_id}:{duration}"
+
         if self._is_duplicate(event_key):
             return
 
-        client: CQHttp = event.bot
+        client = event.bot
 
         group_name = await self._get_group_name(client, group_id)
-        group_name = self._safe_text(group_name)
-
         admin_name = await self._get_admin_name(client, group_id, operator_id)
 
         if duration > 0:
             duration_text = self._parse_duration(duration)
-
-            message = self.plea_template.format(
+            message = self._safe_format(
+                self.plea_template,
                 admin_name=admin_name,
                 group_name=group_name,
                 duration_str=duration_text,
             )
-
-            await self._send_private(client, operator_id, message)
-
-        elif duration == 0:
-            message = self.thanks_template.format(
+        else:
+            message = self._safe_format(
+                self.thanks_template,
                 admin_name=admin_name,
                 group_name=group_name,
             )
 
-            await self._send_private(client, operator_id, message)
+        sent = await self._send_private(client, operator_id, message)
 
-        event.stop_event()
+        if sent:
+            event.stop_event()
 
     async def terminate(self):
         logger.info("BanResponder 插件已卸载。")
